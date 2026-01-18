@@ -51,8 +51,19 @@ def neg_log_likelihood(params: np.ndarray, win: np.ndarray, lose: np.ndarray, y:
     return -float(ll)
 
 
-def fit_participant(g: pd.DataFrame) -> dict:
-    """Fit (lambda, beta) via MLE for one participant."""
+def fit_participant(
+    g: pd.DataFrame,
+    *,
+    lambda_min: float,
+    lambda_max: float,
+    beta_min: float,
+    beta_max: float,
+    boundary_atol_log: float = 1e-3,
+) -> dict:
+    """
+    Fit (lambda, beta) via bounded MLE for one participant.
+    Adds identifiability flags to handle degenerate solutions (e.g., beta -> 0, lambda -> huge).
+    """
     win = g["win"].to_numpy(dtype=float)
     lose = g["lose"].to_numpy(dtype=float)
     y = prepare_y(g["decision"])
@@ -60,11 +71,18 @@ def fit_participant(g: pd.DataFrame) -> dict:
     # Initial guesses: lambda ~ 2, beta ~ 1
     x0 = np.log(np.array([2.0, 1.0], dtype=float))
 
+    # Bounds in log-space
+    bounds = [
+        (np.log(lambda_min), np.log(lambda_max)),  # log_lambda
+        (np.log(beta_min), np.log(beta_max)),      # log_beta
+    ]
+
     opt = minimize(
         neg_log_likelihood,
         x0=x0,
         args=(win, lose, y),
         method="L-BFGS-B",
+        bounds=bounds,
     )
 
     if opt.success:
@@ -74,18 +92,43 @@ def fit_participant(g: pd.DataFrame) -> dict:
         lam_hat = np.nan
         beta_hat = np.nan
 
+    # Boundary flags (in log space)
+    hit_lambda_upper = bool(opt.success and np.isclose(opt.x[0], bounds[0][1], atol=boundary_atol_log))
+    hit_lambda_lower = bool(opt.success and np.isclose(opt.x[0], bounds[0][0], atol=boundary_atol_log))
+    hit_beta_upper = bool(opt.success and np.isclose(opt.x[1], bounds[1][1], atol=boundary_atol_log))
+    hit_beta_lower = bool(opt.success and np.isclose(opt.x[1], bounds[1][0], atol=boundary_atol_log))
+
+    # Identifiability rule:
+    # - must converge
+    # - must NOT be pushed to the boundaries in suspicious ways
+    #   (especially beta at lower bound, or lambda at upper bound)
+    identifiable = bool(opt.success) and (not hit_beta_lower) and (not hit_lambda_upper)
+
     return {
         "n_trials": int(len(g)),
         "lambda_hat": lam_hat,
         "beta_hat": beta_hat,
         "success": bool(opt.success),
+        "identifiable": identifiable,
+        "hit_lambda_lower": hit_lambda_lower,
+        "hit_lambda_upper": hit_lambda_upper,
+        "hit_beta_lower": hit_beta_lower,
+        "hit_beta_upper": hit_beta_upper,
         "neg_ll": float(opt.fun) if opt.fun is not None else np.nan,
         "message": str(opt.message),
     }
 
 
-def estimate_per_participant(df: pd.DataFrame, min_trials: int = 10) -> pd.DataFrame:
-    """Estimate lambda and beta per participant_id."""
+def estimate_per_participant(
+    df: pd.DataFrame,
+    *,
+    min_trials: int,
+    lambda_min: float,
+    lambda_max: float,
+    beta_min: float,
+    beta_max: float,
+) -> pd.DataFrame:
+    """Estimate lambda and beta per participant_id, including identifiability flags."""
     required = {"participant_id", "group", "win", "lose", "decision"}
     missing = required - set(df.columns)
     if missing:
@@ -107,12 +150,23 @@ def estimate_per_participant(df: pd.DataFrame, min_trials: int = 10) -> pd.DataF
                 "lambda_hat": np.nan,
                 "beta_hat": np.nan,
                 "success": False,
+                "identifiable": False,
+                "hit_lambda_lower": False,
+                "hit_lambda_upper": False,
+                "hit_beta_lower": False,
+                "hit_beta_upper": False,
                 "neg_ll": np.nan,
                 "message": f"Too few trials (<{min_trials})",
             })
             continue
 
-        r = fit_participant(g)
+        r = fit_participant(
+            g,
+            lambda_min=lambda_min,
+            lambda_max=lambda_max,
+            beta_min=beta_min,
+            beta_max=beta_max,
+        )
         rows.append({"participant_id": str(pid), "group": group_label, **r})
 
     return pd.DataFrame(rows)
@@ -127,7 +181,7 @@ st.title("Loss Aversion (λ) Estimation — Per Participant")
 
 st.write(
     "Upload multiple CSV files and estimate **λ** (loss aversion) and **β** (choice sensitivity) per participant "
-    "using a logistic choice model with fixed probability **p = 0.5**."
+    "using a bounded maximum-likelihood logistic choice model with fixed probability **p = 0.5**."
 )
 
 with st.expander("Expected CSV columns", expanded=False):
@@ -139,7 +193,7 @@ with st.expander("Expected CSV columns", expanded=False):
         "- `decision` exactly `accept` or `reject`\n"
     )
 
-# Static tables reduce frontend JS usage and often eliminate "module script" errors
+# Static tables reduce frontend JS usage and help avoid "module script" errors
 use_static_tables = st.toggle(
     "Use static tables (recommended)",
     value=True,
@@ -164,13 +218,26 @@ def show_table(df: pd.DataFrame, *, title: str | None = None, max_rows: int = 20
 
 files = st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True)
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     min_trials = st.number_input("Minimum trials per participant", min_value=1, max_value=5000, value=10, step=1)
 with col2:
     show_failed = st.checkbox("Show failed estimates in results table", value=True)
 with col3:
-    st.caption("If many failures occur, check trial counts or participants who always accept/reject.")
+    show_non_identifiable = st.checkbox("Show non-identifiable estimates in results table", value=True)
+with col4:
+    st.caption("Non-identifiable = converged but parameter information is weak (e.g., boundary solutions).")
+
+st.markdown("### Parameter bounds (recommended to avoid degenerate solutions)")
+b1, b2, b3, b4 = st.columns(4)
+with b1:
+    lambda_min = st.number_input("lambda_min", min_value=1e-6, value=0.01, format="%.6f")
+with b2:
+    lambda_max = st.number_input("lambda_max", min_value=0.1, value=50.0, format="%.3f")
+with b3:
+    beta_min = st.number_input("beta_min", min_value=1e-6, value=0.01, format="%.6f")
+with b4:
+    beta_max = st.number_input("beta_max", min_value=0.1, value=50.0, format="%.3f")
 
 if not files:
     st.stop()
@@ -183,7 +250,6 @@ for f in files:
 
 data = pd.concat(dfs, ignore_index=True)
 
-# Minimal preview only (helps stability)
 show_table(data.head(30), title="Data preview", max_rows=30)
 
 st.subheader("Quick validation")
@@ -201,17 +267,34 @@ show_table(participants_per_group, title="Participants per group")
 
 if st.button("Estimate λ per participant", type="primary"):
     with st.spinner("Estimating parameters per participant..."):
-        res = estimate_per_participant(data, min_trials=int(min_trials))
+        res = estimate_per_participant(
+            data,
+            min_trials=int(min_trials),
+            lambda_min=float(lambda_min),
+            lambda_max=float(lambda_max),
+            beta_min=float(beta_min),
+            beta_max=float(beta_max),
+        )
 
     st.success("Estimation completed.")
 
+    # View filtering (table only)
     view = res.copy()
-    if not show_failed:
-        view = view[view["success"] & view["lambda_hat"].notna()].copy()
 
-    show_table(view.sort_values(["group", "participant_id"]), title="Results table (per participant)", max_rows=500)
+    if not show_failed:
+        view = view[view["success"]].copy()
+
+    if not show_non_identifiable:
+        view = view[view["identifiable"]].copy()
+
+    show_table(
+        view.sort_values(["group", "participant_id"]),
+        title="Results table (per participant)",
+        max_rows=500
+    )
 
     st.subheader("Download")
+    # Always export ALL rows for transparency
     out_csv = res.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download results CSV (λ per participant)",
@@ -220,20 +303,27 @@ if st.button("Estimate λ per participant", type="primary"):
         mime="text/csv",
     )
 
+    # --- Analysis set for plots: only identifiable estimates ---
+    ok = res[(res["success"]) & (res["identifiable"]) & (res["lambda_hat"].notna())].copy()
+
     st.subheader("Charts")
-    ok = res[res["success"] & res["lambda_hat"].notna()].copy()
     if ok.empty:
-        st.warning("No successful estimates to plot. Try lowering the minimum trials or inspect your input data.")
+        st.warning(
+            "No identifiable estimates to plot. Consider adjusting bounds or inspect the input data."
+        )
+        # Still show diagnostics
+        diag = res.groupby(["group", "success", "identifiable"]).size().reset_index(name="n")
+        show_table(diag, title="Convergence / identifiability diagnostics", max_rows=200)
         st.stop()
 
-    st.markdown("### Overall distribution of λ (successful estimates)")
+    st.markdown("### Overall distribution of λ (identifiable estimates)")
     fig1, ax1 = plt.subplots()
     ax1.hist(ok["lambda_hat"].values, bins=40)
     ax1.set_xlabel("lambda_hat (λ)")
     ax1.set_ylabel("Number of participants")
     st.pyplot(fig1)
 
-    st.markdown("### Distribution of λ by group")
+    st.markdown("### Distribution of λ by group (identifiable estimates)")
     groups = sorted(ok["group"].unique().tolist())
     for gname in groups:
         sub = ok[ok["group"] == gname]
@@ -244,7 +334,7 @@ if st.button("Estimate λ per participant", type="primary"):
         axg.set_title(f"Group: {gname}")
         st.pyplot(figg)
 
-    st.markdown("### Boxplot of λ by group")
+    st.markdown("### Boxplot of λ by group (identifiable estimates)")
     fig2, ax2 = plt.subplots()
     data_for_box = [ok.loc[ok["group"] == g, "lambda_hat"].values for g in groups]
     ax2.boxplot(data_for_box, labels=groups, showfliers=True)
@@ -252,6 +342,12 @@ if st.button("Estimate λ per participant", type="primary"):
     ax2.set_ylabel("lambda_hat (λ)")
     st.pyplot(fig2)
 
-    diag = res.groupby(["group", "success"]).size().reset_index(name="n")
-    show_table(diag, title="Convergence diagnostics", max_rows=200)
+    # Diagnostics table
+    diag = res.groupby(["group", "success", "identifiable"]).size().reset_index(name="n")
+    show_table(diag, title="Convergence / identifiability diagnostics", max_rows=200)
+
+    # Optional: show how many hit bounds
+    bounds_diag = res.groupby(["group"])[["hit_lambda_lower", "hit_lambda_upper", "hit_beta_lower", "hit_beta_upper"]].sum()
+    show_table(bounds_diag, title="Boundary hits (counts)", max_rows=50)
+
 
