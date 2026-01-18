@@ -139,21 +139,27 @@ with st.expander("Expected CSV columns", expanded=False):
         "- `decision` exactly `accept` or `reject`\n"
     )
 
-# This toggle is specifically to avoid "Importing a module script failed" errors
-# coming from interactive frontend components.
+# Static tables reduce frontend JS usage and often eliminate "module script" errors
 use_static_tables = st.toggle(
-    "Use static tables (recommended if you see 'module script' errors)",
-    value=True
+    "Use static tables (recommended)",
+    value=True,
+    help="Static tables reduce frontend JS usage and are more stable on Streamlit Cloud."
 )
 
-def show_table(df: pd.DataFrame, *, title: str | None = None) -> None:
+def show_table(df: pd.DataFrame, *, title: str | None = None, max_rows: int = 200) -> None:
     """Render a table in the most compatible way for Streamlit Cloud."""
     if title:
         st.subheader(title)
+
+    display_df = df.copy()
+    if len(display_df) > max_rows:
+        st.caption(f"Showing first {max_rows} rows out of {len(display_df)}.")
+        display_df = display_df.head(max_rows)
+
     if use_static_tables:
-        st.table(df)
+        st.table(display_df)
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(display_df, use_container_width=True)
 
 
 files = st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True)
@@ -177,7 +183,8 @@ for f in files:
 
 data = pd.concat(dfs, ignore_index=True)
 
-show_table(data.head(30), title="Data preview")
+# Minimal preview only (helps stability)
+show_table(data.head(30), title="Data preview", max_rows=30)
 
 st.subheader("Quick validation")
 needed = ["participant_id", "group", "win", "lose", "decision"]
@@ -202,7 +209,7 @@ if st.button("Estimate λ per participant", type="primary"):
     if not show_failed:
         view = view[view["success"] & view["lambda_hat"].notna()].copy()
 
-    show_table(view.sort_values(["group", "participant_id"]), title="Results table (per participant)")
+    show_table(view.sort_values(["group", "participant_id"]), title="Results table (per participant)", max_rows=500)
 
     st.subheader("Download")
     out_csv = res.to_csv(index=False).encode("utf-8")
@@ -246,5 +253,5 @@ if st.button("Estimate λ per participant", type="primary"):
     st.pyplot(fig2)
 
     diag = res.groupby(["group", "success"]).size().reset_index(name="n")
-    show_table(diag, title="Convergence diagnostics")
+    show_table(diag, title="Convergence diagnostics", max_rows=200)
 
