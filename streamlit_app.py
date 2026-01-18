@@ -139,13 +139,30 @@ with st.expander("Expected CSV columns", expanded=False):
         "- `decision` exactly `accept` or `reject`\n"
     )
 
+# This toggle is specifically to avoid "Importing a module script failed" errors
+# coming from interactive frontend components.
+use_static_tables = st.toggle(
+    "Use static tables (recommended if you see 'module script' errors)",
+    value=True
+)
+
+def show_table(df: pd.DataFrame, *, title: str | None = None) -> None:
+    """Render a table in the most compatible way for Streamlit Cloud."""
+    if title:
+        st.subheader(title)
+    if use_static_tables:
+        st.table(df)
+    else:
+        st.dataframe(df, use_container_width=True)
+
+
 files = st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True)
 
 col1, col2, col3 = st.columns(3)
 with col1:
     min_trials = st.number_input("Minimum trials per participant", min_value=1, max_value=5000, value=10, step=1)
 with col2:
-    show_failed = st.checkbox("Show failed estimates in table", value=True)
+    show_failed = st.checkbox("Show failed estimates in results table", value=True)
 with col3:
     st.caption("If many failures occur, check trial counts or participants who always accept/reject.")
 
@@ -160,8 +177,7 @@ for f in files:
 
 data = pd.concat(dfs, ignore_index=True)
 
-st.subheader("Data preview")
-st.dataframe(data.head(30), use_container_width=True)
+show_table(data.head(30), title="Data preview")
 
 st.subheader("Quick validation")
 needed = ["participant_id", "group", "win", "lose", "decision"]
@@ -170,14 +186,11 @@ if missing_cols:
     st.error(f"Missing required columns: {missing_cols}")
     st.stop()
 
-st.write("Rows per group:")
-st.dataframe(data["group"].value_counts().rename_axis("group").to_frame("rows"), use_container_width=True)
+rows_per_group = data["group"].value_counts().rename_axis("group").to_frame("rows")
+show_table(rows_per_group, title="Rows per group")
 
-st.write("Participants per group:")
-st.dataframe(
-    data.groupby("group")["participant_id"].nunique().rename("n_participants").to_frame(),
-    use_container_width=True,
-)
+participants_per_group = data.groupby("group")["participant_id"].nunique().rename("n_participants").to_frame()
+show_table(participants_per_group, title="Participants per group")
 
 if st.button("Estimate λ per participant", type="primary"):
     with st.spinner("Estimating parameters per participant..."):
@@ -189,8 +202,7 @@ if st.button("Estimate λ per participant", type="primary"):
     if not show_failed:
         view = view[view["success"] & view["lambda_hat"].notna()].copy()
 
-    st.subheader("Results table (per participant)")
-    st.dataframe(view.sort_values(["group", "participant_id"]), use_container_width=True)
+    show_table(view.sort_values(["group", "participant_id"]), title="Results table (per participant)")
 
     st.subheader("Download")
     out_csv = res.to_csv(index=False).encode("utf-8")
@@ -202,7 +214,6 @@ if st.button("Estimate λ per participant", type="primary"):
     )
 
     st.subheader("Charts")
-
     ok = res[res["success"] & res["lambda_hat"].notna()].copy()
     if ok.empty:
         st.warning("No successful estimates to plot. Try lowering the minimum trials or inspect your input data.")
@@ -234,6 +245,6 @@ if st.button("Estimate λ per participant", type="primary"):
     ax2.set_ylabel("lambda_hat (λ)")
     st.pyplot(fig2)
 
-    st.markdown("### Convergence diagnostics")
     diag = res.groupby(["group", "success"]).size().reset_index(name="n")
-    st.dataframe(diag, use_container_width=True)
+    show_table(diag, title="Convergence diagnostics")
+
